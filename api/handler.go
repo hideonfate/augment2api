@@ -501,16 +501,16 @@ func ModelsHandler(c *gin.Context) {
 		Object: "list",
 		Data: []ModelObject{
 			{
-				ID:      "claude-3.7-agent",
+				ID:      "claude-4-agent",
 				Object:  "model",
 				Created: 1708387200,
 				OwnedBy: "anthropic",
 			},
 			{
-				ID:      "augment-chat",
+				ID:      "claude-4-chat",
 				Object:  "model",
 				Created: 1708387200,
-				OwnedBy: "augment",
+				OwnedBy: "anthropic",
 			},
 		},
 	}
@@ -627,7 +627,7 @@ func handleStreamRequest(c *gin.Context, augmentReq AugmentRequest, model string
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("User-Agent", config.AppConfig.UserAgent)
-	req.Header.Set("x-api-version", "2")
+	req.Header.Set("x-api-version", "5")
 
 	// 生成请求ID
 	requestID := uuid.New().String()
@@ -686,7 +686,7 @@ func handleStreamRequest(c *gin.Context, augmentReq AugmentRequest, model string
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Authorization", "Bearer "+token)
 		req.Header.Set("User-Agent", config.AppConfig.UserAgent)
-		req.Header.Set("x-api-version", "2")
+		req.Header.Set("x-api-version", "5")
 		req.Header.Set("x-request-id", requestID)
 		req.Header.Set("x-request-session-id", sessionID)
 
@@ -758,7 +758,7 @@ func handleStreamRequest(c *gin.Context, augmentReq AugmentRequest, model string
 				req.Header.Set("Content-Type", "application/json")
 				req.Header.Set("Authorization", "Bearer "+token)
 				req.Header.Set("User-Agent", config.AppConfig.UserAgent)
-				req.Header.Set("x-api-version", "2")
+				req.Header.Set("x-api-version", "5")
 				req.Header.Set("x-request-id", requestID)
 				req.Header.Set("x-request-session-id", sessionID)
 
@@ -895,7 +895,7 @@ func handleStreamRequest(c *gin.Context, augmentReq AugmentRequest, model string
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Authorization", "Bearer "+token)
 		req.Header.Set("User-Agent", config.AppConfig.UserAgent)
-		req.Header.Set("x-api-version", "2")
+		req.Header.Set("x-api-version", "5")
 		req.Header.Set("x-request-id", requestID)
 		req.Header.Set("x-request-session-id", sessionID)
 
@@ -1076,7 +1076,7 @@ func handleNonStreamRequest(c *gin.Context, augmentReq AugmentRequest, model str
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("User-Agent", config.AppConfig.UserAgent)
-	req.Header.Set("x-api-version", "2")
+	req.Header.Set("x-api-version", "5")
 
 	// 生成请求ID
 	requestID := uuid.New().String()
