@@ -36,8 +36,8 @@ func getTokenLock(token string) *sync.Mutex {
 // TokenConcurrencyMiddleware 控制Redis中token的使用频率
 func TokenConcurrencyMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		// 只对聊天完成请求进行并发控制
-		if !strings.HasSuffix(c.Request.URL.Path, "/chat/completions") {
+		// 只对聊天完成请求和消息请求进行并发控制
+		if !strings.HasSuffix(c.Request.URL.Path, "/chat/completions") && !strings.HasSuffix(c.Request.URL.Path, "/messages") {
 			c.Next()
 			return
 		}
@@ -49,6 +49,7 @@ func TokenConcurrencyMiddleware() gin.HandlerFunc {
 			c.Set("token", token)
 			c.Set("tenant_url", tenantURL)
 			c.Next()
+			return
 		}
 
 		// 获取一个可用的token

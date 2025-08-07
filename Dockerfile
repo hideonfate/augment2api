@@ -4,6 +4,10 @@ FROM golang:1.23-alpine AS builder
 # 设置工作目录
 WORKDIR /app
 
+# 设置 Go proxy 为国内镜像
+ENV GOPROXY=https://goproxy.cn,direct
+ENV GOSUMDB=sum.golang.google.cn
+
 # 复制 go.mod 和 go.sum 文件
 COPY go.mod go.sum ./
 

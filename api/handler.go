@@ -21,7 +21,7 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-// OpenAIRequest OpenAI兼容的请求结构
+// OpenAI兼容的请求结构
 type OpenAIRequest struct {
 	Model       string        `json:"model,omitempty"`
 	Messages    []ChatMessage `json:"messages,omitempty"`
@@ -30,7 +30,16 @@ type OpenAIRequest struct {
 	MaxTokens   int           `json:"max_tokens,omitempty"`
 }
 
-// OpenAIResponse OpenAI兼容的响应结构
+// Anthropic兼容的请求结构
+type AnthropicRequest struct {
+	Model       string        `json:"model"`
+	MaxTokens   int           `json:"max_tokens"`
+	Messages    []ChatMessage `json:"messages"`
+	Stream      bool          `json:"stream,omitempty"`
+	Temperature float64       `json:"temperature,omitempty"`
+}
+
+// OpenAI兼容的响应结构
 type OpenAIResponse struct {
 	ID      string   `json:"id"`
 	Object  string   `json:"object"`
@@ -40,13 +49,44 @@ type OpenAIResponse struct {
 	Usage   Usage    `json:"usage"`
 }
 
-// OpenAIStreamResponse OpenAI兼容的流式响应结构
+// OpenAI兼容的流式响应结构
 type OpenAIStreamResponse struct {
 	ID      string         `json:"id"`
 	Object  string         `json:"object"`
 	Created int64          `json:"created"`
 	Model   string         `json:"model"`
 	Choices []StreamChoice `json:"choices"`
+}
+
+// Anthropic兼容的响应结构
+type AnthropicResponse struct {
+	ID           string                 `json:"id"`
+	Type         string                 `json:"type"`
+	Role         string                 `json:"role"`
+	Content      []AnthropicContent     `json:"content"`
+	Model        string                 `json:"model"`
+	StopReason   *string                `json:"stop_reason"`
+	StopSequence *string                `json:"stop_sequence"`
+	Usage        AnthropicUsage         `json:"usage"`
+}
+
+// Anthropic兼容的流式响应结构
+type AnthropicStreamResponse struct {
+	Type  string      `json:"type"`
+	Index int         `json:"index,omitempty"`
+	Delta interface{} `json:"delta,omitempty"`
+}
+
+// Anthropic内容结构
+type AnthropicContent struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
+}
+
+// Anthropic使用统计结构
+type AnthropicUsage struct {
+	InputTokens  int `json:"input_tokens"`
+	OutputTokens int `json:"output_tokens"`
 }
 
 type StreamChoice struct {
@@ -331,6 +371,151 @@ func convertToAugmentRequest(req OpenAIRequest) AugmentRequest {
 	return augmentReq
 }
 
+// convertAnthropicToAugmentRequest 将Anthropic请求转换为Augment请求
+func convertAnthropicToAugmentRequest(req AnthropicRequest) AugmentRequest {
+	// 确定模式和其他参数基于模型名称
+	mode := "CHAT" // 默认使用CHAT模式
+	userGuideLines := "must answer in Chinese."
+	includeToolDefinitions := false
+	includeDefaultPrompt := false
+
+	// 将模型名称转换为小写，然后检查后缀
+	modelLower := strings.ToLower(req.Model)
+
+	// 检查模型名称后缀 (不区分大小写)
+	if strings.HasSuffix(modelLower, "-chat") {
+		// 保持使用CHAT模式的默认设置
+		mode = "CHAT"
+	} else if strings.HasSuffix(modelLower, "-agent") {
+		// 使用AGENT模式
+		mode = "AGENT"
+		userGuideLines = "must answer in Chinese, do not use tools, and for questions involving internet searches, please answer based on your existing knowledge."
+		includeToolDefinitions = true
+		includeDefaultPrompt = true
+	}
+
+	augmentReq := AugmentRequest{
+		Path:           "",                  // 这个是关联的项目文件路径，暂时传空，不影响对话
+		Mode:           mode,                // 根据模型名称决定模式
+		Prefix:         defaultPrefix,       // 固定前缀，影响模型回复风格
+		Suffix:         " ",                 // 固定后缀，暂时传空，不影响对话
+		Lang:           detectLanguageFromAnthropic(req), // 简单检测当前对话语言类型
+		Message:        "",                  // 当前对话消息
+		UserGuideLines: userGuideLines,      // 根据模型类型设置指南
+		// 初始化为空列表
+		ChatHistory: make([]AugmentChatHistory, 0),
+		Blobs: struct {
+			CheckpointID string        `json:"checkpoint_id"`
+			AddedBlobs   []interface{} `json:"added_blobs"`
+			DeletedBlobs []interface{} `json:"deleted_blobs"`
+		}{
+			CheckpointID: generateCheckpointID(),
+			AddedBlobs:   make([]interface{}, 0),
+			DeletedBlobs: make([]interface{}, 0),
+		},
+		UserGuidedBlobs:   make([]interface{}, 0),
+		ExternalSourceIds: make([]interface{}, 0),
+		FeatureDetectionFlags: struct {
+			SupportRawOutput bool `json:"support_raw_output"`
+		}{
+			SupportRawOutput: true,
+		},
+		ToolDefinitions: []ToolDefinition{}, // 初始化为空
+		Nodes:           make([]Node, 0),
+	}
+
+	// 根据模型类型决定是否包含工具定义
+	if includeToolDefinitions {
+		augmentReq.ToolDefinitions = getFullToolDefinitions()
+	}
+
+	// 处理消息历史
+	if len(req.Messages) > 1 { // 有历史消息
+		// 每次处理一对消息（用户问题和助手回答）
+		for i := 0; i < len(req.Messages)-1; i += 2 {
+			if i+1 < len(req.Messages) {
+				userMsg := req.Messages[i]
+				assistantMsg := req.Messages[i+1]
+
+				chatHistory := AugmentChatHistory{
+					RequestMessage: userMsg.GetContent(),
+					ResponseText:   assistantMsg.GetContent(),
+					RequestID:      generateRequestID(), // 生成唯一的请求ID
+					RequestNodes:   make([]Node, 0),
+					ResponseNodes: []Node{
+						{
+							ID:      0,
+							Type:    0,
+							Content: assistantMsg.GetContent(),
+							ToolUse: ToolUse{
+								ToolUseID: "",
+								ToolName:  "",
+								InputJSON: "",
+							},
+							AgentMemory: AgentMemory{
+								Content: "",
+							},
+						},
+					},
+				}
+				augmentReq.ChatHistory = append(augmentReq.ChatHistory, chatHistory)
+			}
+		}
+	}
+
+	// 设置当前消息
+	if len(req.Messages) > 0 {
+		lastMsg := req.Messages[len(req.Messages)-1]
+		if includeDefaultPrompt {
+			augmentReq.Message = defaultPrompt + "\n" + lastMsg.GetContent()
+		} else {
+			augmentReq.Message = lastMsg.GetContent()
+		}
+	}
+
+	return augmentReq
+}
+
+// detectLanguageFromAnthropic 从Anthropic请求中检测编程语言
+func detectLanguageFromAnthropic(req AnthropicRequest) string {
+	if len(req.Messages) == 0 {
+		return ""
+	}
+
+	content := req.Messages[len(req.Messages)-1].GetContent()
+	// 简单判断一下当前对话语言类型
+	if strings.Contains(strings.ToLower(content), "html") {
+		return "HTML"
+	} else if strings.Contains(strings.ToLower(content), "python") {
+		return "Python"
+	} else if strings.Contains(strings.ToLower(content), "javascript") {
+		return "JavaScript"
+	} else if strings.Contains(strings.ToLower(content), "go") {
+		return "Go"
+	} else if strings.Contains(strings.ToLower(content), "rust") {
+		return "Rust"
+	} else if strings.Contains(strings.ToLower(content), "java") {
+		return "Java"
+	} else if strings.Contains(strings.ToLower(content), "c++") {
+		return "C++"
+	} else if strings.Contains(strings.ToLower(content), "c#") {
+		return "C#"
+	} else if strings.Contains(strings.ToLower(content), "php") {
+		return "PHP"
+	} else if strings.Contains(strings.ToLower(content), "ruby") {
+		return "Ruby"
+	} else if strings.Contains(strings.ToLower(content), "swift") {
+		return "Swift"
+	} else if strings.Contains(strings.ToLower(content), "kotlin") {
+		return "Kotlin"
+	} else if strings.Contains(strings.ToLower(content), "typescript") {
+		return "TypeScript"
+	} else if strings.Contains(strings.ToLower(content), "c") {
+		return "C"
+	}
+	return "HTML"
+}
+
 // generateRequestID 生成唯一的请求ID
 func generateRequestID() string {
 	// 使用UUID v4生成唯一ID
@@ -540,6 +725,30 @@ func ChatCompletionsHandler(c *gin.Context) {
 
 	// 处理非流式请求
 	handleNonStreamRequest(c, augmentReq, req.Model)
+}
+
+// AnthropicMessagesHandler 处理Anthropic兼容的消息请求
+func AnthropicMessagesHandler(c *gin.Context) {
+	// 获取请求数据
+	var req AnthropicRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的请求数据"})
+		// 确保在错误情况下也清理请求状态
+		cleanupRequestStatus(c)
+		return
+	}
+
+	// 转换为Augment请求格式
+	augmentReq := convertAnthropicToAugmentRequest(req)
+
+	// 处理流式请求
+	if req.Stream {
+		handleAnthropicStreamRequest(c, augmentReq, req.Model)
+		return
+	}
+
+	// 处理非流式请求
+	handleAnthropicNonStreamRequest(c, augmentReq, req.Model)
 }
 
 // 异步处理token使用计数
@@ -1300,4 +1509,550 @@ func incrementTokenUsage(token string, model string) {
 			logger.Log.Error("增加token总使用计数失败: %v", err)
 		}
 	}
+}
+
+// handleAnthropicStreamRequest 处理Anthropic流式请求
+func handleAnthropicStreamRequest(c *gin.Context, augmentReq AugmentRequest, model string) {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Log.WithFields(logrus.Fields{
+				"error": r,
+				"model": model,
+			}).Error("处理Anthropic流式请求时发生panic")
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "服务器内部错误"})
+		}
+		// 函数返回时同步清理请求状态
+		cleanupRequestStatus(c)
+	}()
+
+	// 从上下文中获取token和tenant_url
+	tokenInterface, exists := c.Get("token")
+	tenantURLInterface, exists2 := c.Get("tenant_url")
+
+	var token, tenant string
+
+	if exists && exists2 {
+		token, _ = tokenInterface.(string)
+		tenant, _ = tenantURLInterface.(string)
+	}
+
+	// 如果上下文中没有，则使用GetAuthInfo获取
+	if token == "" || tenant == "" {
+		token, tenant = GetAuthInfo()
+	}
+
+	if token == "" || tenant == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "无可用Token,请先在管理页面获取"})
+		return
+	}
+
+	// 异步处理token使用计数
+	asyncIncrementTokenUsage(token, model)
+
+	// 准备请求数据
+	jsonData, err := json.Marshal(augmentReq)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "序列化请求失败"})
+		return
+	}
+
+	// 提取主机部分
+	parsedURL, err := url.Parse(tenant)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "解析租户URL失败"})
+		return
+	}
+	hostName := parsedURL.Host
+
+	// 创建请求
+	requestURL := tenant + "chat-stream"
+	req, err := http.NewRequest("POST", requestURL, bytes.NewReader(jsonData))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "创建请求失败"})
+		return
+	}
+
+	// 设置请求头
+	req.Header.Set("Host", hostName)
+	req.Header.Set("Content-Length", fmt.Sprintf("%d", len(jsonData)))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("User-Agent", config.AppConfig.UserAgent)
+	req.Header.Set("x-api-version", "5")
+
+	// 生成请求ID
+	requestID := uuid.New().String()
+	req.Header.Set("x-request-id", requestID)
+
+	// 从context中获取session_id
+	sessionIDInterface, exists := c.Get("session_id")
+	var sessionID string
+	if !exists {
+		// 使用随机session-id
+		sessionID = uuid.New().String()
+		logger.Log.WithFields(logrus.Fields{
+			"token": token,
+		}).Warn("context中未找到session_id，使用随机session-id")
+	} else {
+		sessionID = sessionIDInterface.(string)
+	}
+	req.Header.Set("x-request-session-id", sessionID)
+
+	client := createHTTPClient()
+	flusher, ok := c.Writer.(http.Flusher)
+	if !ok {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "流式传输不支持"})
+		return
+	}
+
+	// 设置Anthropic流式响应头
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		logger.Log.WithFields(logrus.Fields{
+			"error": err.Error(),
+			"mode":  augmentReq.Mode,
+		}).Error("请求失败")
+
+		// 切换到CHAT模式
+		augmentReq.Mode = "CHAT"
+		augmentReq.UserGuideLines = "使用中文回答"
+		augmentReq.ToolDefinitions = []ToolDefinition{}
+
+		// 重新准备请求数据
+		jsonData, err = json.Marshal(augmentReq)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "序列化请求失败"})
+			return
+		}
+
+		// 创建新的请求
+		req, err = http.NewRequest("POST", requestURL, bytes.NewReader(jsonData))
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "创建请求失败"})
+			return
+		}
+
+		// 设置相同的请求头
+		req.Header.Set("Host", hostName)
+		req.Header.Set("Content-Length", fmt.Sprintf("%d", len(jsonData)))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("User-Agent", config.AppConfig.UserAgent)
+		req.Header.Set("x-api-version", "5")
+		req.Header.Set("x-request-id", requestID)
+		req.Header.Set("x-request-session-id", sessionID)
+
+		// 重新发送请求
+		resp, err = client.Do(req)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "请求失败: " + err.Error()})
+			return
+		}
+	}
+	defer resp.Body.Close()
+
+	// 检查响应状态码
+	if resp.StatusCode != http.StatusOK {
+		body, err := io.ReadAll(resp.Body)
+		errMsg := "Augment response error"
+		if err == nil {
+			errMsg = errMsg + ": " + string(body)
+		}
+		c.JSON(resp.StatusCode, gin.H{"error": errMsg})
+		return
+	}
+
+	reader := bufio.NewReader(resp.Body)
+
+	var fullText string
+	var hasError bool
+
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			logger.Log.WithFields(logrus.Fields{
+				"error": err.Error(),
+				"mode":  augmentReq.Mode,
+			}).Error("读取响应失败")
+			break
+		}
+
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		var augmentResp AugmentResponse
+		if err := json.Unmarshal([]byte(line), &augmentResp); err != nil {
+			log.Printf("解析响应失败: %v", err)
+			continue
+		}
+
+		// 检查响应内容是否包含错误信息
+		if strings.Contains(augmentResp.Text, errBlocked) {
+			hasError = true
+
+			// 将当前token加入冷却队列，冷却时间10分钟
+			logger.Log.WithFields(logrus.Fields{
+				"token": token,
+				"mode":  augmentReq.Mode,
+			}).Info("检测到block信息，将token加入冷却队列10分钟")
+
+			err := SetTokenCoolStatus(token, 10*time.Minute)
+			if err != nil {
+				logger.Log.WithFields(logrus.Fields{
+					"token": token,
+					"error": err.Error(),
+				}).Error("将token加入冷却队列失败")
+			}
+
+			break
+		}
+
+		fullText += augmentResp.Text
+
+		// 创建Anthropic兼容的流式响应
+		if augmentResp.Text != "" {
+			streamResp := AnthropicStreamResponse{
+				Type: "content_block_delta",
+				Index: 0,
+				Delta: map[string]interface{}{
+					"type": "text_delta",
+					"text": augmentResp.Text,
+				},
+			}
+
+			// 序列化并发送响应
+			jsonResp, err := json.Marshal(streamResp)
+			if err != nil {
+				log.Printf("序列化响应失败: %v", err)
+				continue
+			}
+
+			fmt.Fprintf(c.Writer, "event: content_block_delta\ndata: %s\n\n", jsonResp)
+			flusher.Flush()
+		}
+
+		// 如果完成，发送最后的消息完成事件
+		if augmentResp.Done {
+			stopResp := AnthropicStreamResponse{
+				Type: "message_stop",
+			}
+			jsonResp, err := json.Marshal(stopResp)
+			if err == nil {
+				fmt.Fprintf(c.Writer, "event: message_stop\ndata: %s\n\n", jsonResp)
+				flusher.Flush()
+			}
+			break
+		}
+	}
+
+	// 如果检测到错误信息，尝试切换到CHAT模式重新请求
+	if hasError && augmentReq.Mode != "CHAT" {
+		logger.Log.WithFields(logrus.Fields{
+			"mode": augmentReq.Mode,
+		}).Info("检测到block信息，尝试切换到 CHAT 模式回复！")
+
+		// 切换到CHAT模式
+		augmentReq.Mode = "CHAT"
+		augmentReq.UserGuideLines = "使用中文回答"
+		augmentReq.ToolDefinitions = []ToolDefinition{}
+
+		// 重新准备请求数据
+		jsonData, err = json.Marshal(augmentReq)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "序列化请求失败"})
+			return
+		}
+
+		// 创建新的请求
+		req, err = http.NewRequest("POST", requestURL, bytes.NewReader(jsonData))
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "创建请求失败"})
+			return
+		}
+
+		// 设置相同的请求头
+		req.Header.Set("Host", hostName)
+		req.Header.Set("Content-Length", fmt.Sprintf("%d", len(jsonData)))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("User-Agent", config.AppConfig.UserAgent)
+		req.Header.Set("x-api-version", "5")
+		req.Header.Set("x-request-id", requestID)
+		req.Header.Set("x-request-session-id", sessionID)
+
+		// 重新发送请求
+		resp, err = client.Do(req)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "请求失败: " + err.Error()})
+			return
+		}
+		defer resp.Body.Close()
+
+		// 检查响应状态码
+		if resp.StatusCode != http.StatusOK {
+			body, err := io.ReadAll(resp.Body)
+			errMsg := "Augment response error"
+			if err == nil {
+				errMsg = errMsg + ": " + string(body)
+			}
+			c.JSON(resp.StatusCode, gin.H{"error": errMsg})
+			return
+		}
+
+		// 读取并转发响应
+		reader = bufio.NewReader(resp.Body)
+
+		fullText = ""
+		for {
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				if err == io.EOF {
+					break
+				}
+				log.Printf("读取响应失败: %v", err)
+				break
+			}
+
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+
+			var augmentResp AugmentResponse
+			if err := json.Unmarshal([]byte(line), &augmentResp); err != nil {
+				log.Printf("解析响应失败: %v", err)
+				continue
+			}
+
+			fullText += augmentResp.Text
+
+			// 创建Anthropic兼容的流式响应
+			if augmentResp.Text != "" {
+				streamResp := AnthropicStreamResponse{
+					Type: "content_block_delta",
+					Index: 0,
+					Delta: map[string]interface{}{
+						"type": "text_delta",
+						"text": augmentResp.Text,
+					},
+				}
+
+				// 序列化并发送响应
+				jsonResp, err := json.Marshal(streamResp)
+				if err != nil {
+					log.Printf("序列化响应失败: %v", err)
+					continue
+				}
+
+				fmt.Fprintf(c.Writer, "event: content_block_delta\ndata: %s\n\n", jsonResp)
+				flusher.Flush()
+			}
+
+			// 如果完成，发送最后的消息完成事件
+			if augmentResp.Done {
+				stopResp := AnthropicStreamResponse{
+					Type: "message_stop",
+				}
+				jsonResp, err := json.Marshal(stopResp)
+				if err == nil {
+					fmt.Fprintf(c.Writer, "event: message_stop\ndata: %s\n\n", jsonResp)
+					flusher.Flush()
+				}
+				break
+			}
+		}
+	}
+}
+
+// handleAnthropicNonStreamRequest 处理Anthropic非流式请求
+func handleAnthropicNonStreamRequest(c *gin.Context, augmentReq AugmentRequest, model string) {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Log.WithFields(logrus.Fields{
+				"error": r,
+				"model": model,
+			}).Error("处理Anthropic非流式请求时发生panic")
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "服务器内部错误"})
+		}
+		cleanupRequestStatus(c) // 确保在函数返回时同步清理请求状态
+	}()
+
+	// 从上下文中获取token和tenant_url
+	tokenInterface, exists := c.Get("token")
+	tenantURLInterface, exists2 := c.Get("tenant_url")
+
+	var token, tenant string
+
+	if exists && exists2 {
+		token, _ = tokenInterface.(string)
+		tenant, _ = tenantURLInterface.(string)
+	}
+
+	// 如果上下文中没有，则使用GetAuthInfo获取
+	if token == "" || tenant == "" {
+		token, tenant = GetAuthInfo()
+	}
+
+	if token == "" || tenant == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "无可用Token,请先在管理页面获取"})
+		return
+	}
+
+	// 异步处理token使用计数
+	asyncIncrementTokenUsage(token, model)
+
+	// 准备请求数据
+	jsonData, err := json.Marshal(augmentReq)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "序列化请求失败"})
+		return
+	}
+
+	// 提取租户地址
+	parsedURL, err := url.Parse(tenant)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "解析租户URL失败"})
+		return
+	}
+	hostName := parsedURL.Host
+
+	requestURL := tenant + "chat-stream"
+	req, err := http.NewRequest("POST", requestURL, bytes.NewReader(jsonData))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "创建请求失败"})
+		return
+	}
+
+	// 设置请求头
+	req.Header.Set("Host", hostName)
+	req.Header.Set("Content-Length", fmt.Sprintf("%d", len(jsonData)))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("User-Agent", config.AppConfig.UserAgent)
+	req.Header.Set("x-api-version", "5")
+
+	// 生成请求ID
+	requestID := uuid.New().String()
+	req.Header.Set("x-request-id", requestID)
+
+	sessionIDInterface, exists := c.Get("session_id")
+	var sessionID string
+	if !exists {
+		// 使用随机session-id
+		sessionID = uuid.New().String()
+		logger.Log.WithFields(logrus.Fields{
+			"token": token,
+		}).Warn("context中未找到session_id，使用随机session-id")
+	} else {
+		sessionID = sessionIDInterface.(string)
+	}
+	req.Header.Set("x-request-session-id", sessionID)
+
+	client := createHTTPClient()
+	resp, err := client.Do(req)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "请求失败: " + err.Error()})
+		return
+	}
+	defer resp.Body.Close()
+
+	// 检查响应状态码
+	if resp.StatusCode != http.StatusOK {
+		body, err := io.ReadAll(resp.Body)
+		errMsg := "Augment response error"
+		if err == nil {
+			errMsg = errMsg + ": " + string(body)
+		}
+		c.JSON(resp.StatusCode, gin.H{"error": errMsg})
+		return
+	}
+
+	// 读取完整响应
+	reader := bufio.NewReader(resp.Body)
+	var fullText string
+
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "读取响应失败: " + err.Error()})
+			return
+		}
+
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		var augmentResp AugmentResponse
+		if err := json.Unmarshal([]byte(line), &augmentResp); err != nil {
+			continue
+		}
+
+		fullText += augmentResp.Text
+
+		// 检查响应内容是否包含错误信息
+		if strings.Contains(augmentResp.Text, errBlocked) {
+			// 将当前token加入冷却队列，冷却时间10分钟
+			logger.Log.WithFields(logrus.Fields{
+				"token": token,
+				"mode":  augmentReq.Mode,
+			}).Info("检测到block信息，将token加入冷却队列10分钟")
+
+			err := SetTokenCoolStatus(token, 10*time.Minute)
+			if err != nil {
+				logger.Log.WithFields(logrus.Fields{
+					"token": token,
+					"error": err.Error(),
+				}).Error("将token加入冷却队列失败")
+			}
+		}
+
+		if augmentResp.Done {
+			break
+		}
+	}
+
+	// 创建Anthropic兼容的响应
+	stopReason := "end_turn"
+
+	// 估算token数量
+	inputTokens := estimateTokenCount(augmentReq.Message)
+	for _, history := range augmentReq.ChatHistory {
+		inputTokens += estimateTokenCount(history.RequestMessage)
+		inputTokens += estimateTokenCount(history.ResponseText)
+	}
+	outputTokens := estimateTokenCount(fullText)
+
+	anthropicResp := AnthropicResponse{
+		ID:   fmt.Sprintf("msg_%d", time.Now().Unix()),
+		Type: "message",
+		Role: "assistant",
+		Content: []AnthropicContent{
+			{
+				Type: "text",
+				Text: fullText,
+			},
+		},
+		Model:        model,
+		StopReason:   &stopReason,
+		StopSequence: nil,
+		Usage: AnthropicUsage{
+			InputTokens:  inputTokens,
+			OutputTokens: outputTokens,
+		},
+	}
+
+	c.JSON(http.StatusOK, anthropicResp)
 }

@@ -214,6 +214,8 @@ func setupRouter() *gin.Engine {
 			chatGroup.POST("/v1/chat/completions", api.ChatCompletionsHandler)
 			chatGroup.POST("/v1", api.ChatCompletionsHandler)
 			chatGroup.POST("/v1/chat", api.ChatCompletionsHandler)
+			// Anthropic兼容的消息端点
+			chatGroup.POST("/v1/messages", api.AnthropicMessagesHandler)
 		}
 
 		authGroup.GET("/v1/models", api.ModelsHandler)
