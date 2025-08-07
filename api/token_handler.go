@@ -457,7 +457,7 @@ func CheckTokenTenantURL(token string, sessionID string) (string, error) {
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Authorization", "Bearer "+token)
 		req.Header.Set("User-Agent", config.AppConfig.UserAgent)
-		req.Header.Set("x-api-version", "6")
+		req.Header.Set("x-api-version", "2")
 		req.Header.Set("x-request-id", uuid.New().String())
 		req.Header.Set("x-request-session-id", sessionID)
 

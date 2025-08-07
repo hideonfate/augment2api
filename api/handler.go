@@ -836,7 +836,7 @@ func handleStreamRequest(c *gin.Context, augmentReq AugmentRequest, model string
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("User-Agent", config.AppConfig.UserAgent)
-	req.Header.Set("x-api-version", "5")
+	req.Header.Set("x-api-version", "2")
 
 	// 生成请求ID
 	requestID := uuid.New().String()
