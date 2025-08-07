@@ -3,6 +3,7 @@ package api
 import (
 	"augment2api/config"
 	"augment2api/pkg/logger"
+	tokenmanager "augment2api/pkg/token"
 	"bufio"
 	"bytes"
 	"crypto/sha256"
@@ -717,14 +718,8 @@ func ChatCompletionsHandler(c *gin.Context) {
 	// 转换为Augment请求格式
 	augmentReq := convertToAugmentRequest(req)
 
-	// 处理流式请求
-	if req.Stream {
-		handleStreamRequest(c, augmentReq, req.Model)
-		return
-	}
-
-	// 处理非流式请求
-	handleNonStreamRequest(c, augmentReq, req.Model)
+	// 优先使用流式输出，如果失败则降级到非流式输出
+	handleRequestWithStreamFallback(c, augmentReq, req.Model, req.Stream)
 }
 
 // AnthropicMessagesHandler 处理Anthropic兼容的消息请求
@@ -741,14 +736,8 @@ func AnthropicMessagesHandler(c *gin.Context) {
 	// 转换为Augment请求格式
 	augmentReq := convertAnthropicToAugmentRequest(req)
 
-	// 处理流式请求
-	if req.Stream {
-		handleAnthropicStreamRequest(c, augmentReq, req.Model)
-		return
-	}
-
-	// 处理非流式请求
-	handleAnthropicNonStreamRequest(c, augmentReq, req.Model)
+	// 优先使用流式输出，如果失败则降级到非流式输出
+	handleAnthropicRequestWithStreamFallback(c, augmentReq, req.Model, req.Stream)
 }
 
 // 异步处理token使用计数
@@ -870,6 +859,15 @@ func handleStreamRequest(c *gin.Context, augmentReq AugmentRequest, model string
 			"mode":  augmentReq.Mode,
 		}).Error("请求失败")
 
+		// 检查是否是连接错误，如果是则尝试切换Token重试
+		if shouldRetryError(err.Error()) {
+			if tokenmanager.SwitchTokenAndRetry(c, 3) {
+				// 递归调用自身进行重试
+				handleStreamRequest(c, augmentReq, model)
+				return
+			}
+		}
+
 		// 切换到CHAT模式
 		augmentReq.Mode = "CHAT"
 		augmentReq.UserGuideLines = "使用中文回答"
@@ -902,6 +900,14 @@ func handleStreamRequest(c *gin.Context, augmentReq AugmentRequest, model string
 		// 重新发送请求
 		resp, err = client.Do(req)
 		if err != nil {
+			// 再次检查是否是连接错误，如果是则尝试切换Token重试
+			if shouldRetryError(err.Error()) {
+				if tokenmanager.SwitchTokenAndRetry(c, 3) {
+					// 递归调用自身进行重试
+					handleStreamRequest(c, augmentReq, model)
+					return
+				}
+			}
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "请求失败: " + err.Error()})
 			return
 		}
@@ -915,6 +921,17 @@ func handleStreamRequest(c *gin.Context, augmentReq AugmentRequest, model string
 		if err == nil {
 			errMsg = errMsg + ": " + string(body)
 		}
+
+		// 检查是否需要切换Token重试
+		if shouldRetryStatusCode(resp.StatusCode) || shouldRetryError(errMsg) {
+			resp.Body.Close() // 关闭当前响应体
+			if tokenmanager.SwitchTokenAndRetry(c, 3) {
+				// 递归调用自身进行重试
+				handleStreamRequest(c, augmentReq, model)
+				return
+			}
+		}
+
 		c.JSON(resp.StatusCode, gin.H{"error": errMsg})
 		return
 	}
@@ -1018,7 +1035,7 @@ func handleStreamRequest(c *gin.Context, augmentReq AugmentRequest, model string
 				"mode":  augmentReq.Mode,
 			}).Info("检测到block信息，将token加入冷却队列10分钟")
 
-			err := SetTokenCoolStatus(token, 10*time.Minute)
+			err := tokenmanager.SetTokenCoolStatus(token, 10*time.Minute)
 			if err != nil {
 				logger.Log.WithFields(logrus.Fields{
 					"token": token,
@@ -1307,6 +1324,14 @@ func handleNonStreamRequest(c *gin.Context, augmentReq AugmentRequest, model str
 	client := createHTTPClient()
 	resp, err := client.Do(req)
 	if err != nil {
+		// 检查是否是连接错误，如果是则尝试切换Token重试
+		if shouldRetryError(err.Error()) {
+			if tokenmanager.SwitchTokenAndRetry(c, 3) {
+				// 递归调用自身进行重试
+				handleNonStreamRequest(c, augmentReq, model)
+				return
+			}
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "请求失败: " + err.Error()})
 		return
 	}
@@ -1319,6 +1344,17 @@ func handleNonStreamRequest(c *gin.Context, augmentReq AugmentRequest, model str
 		if err == nil {
 			errMsg = errMsg + ": " + string(body)
 		}
+
+		// 检查是否需要切换Token重试
+		if shouldRetryStatusCode(resp.StatusCode) || shouldRetryError(errMsg) {
+			resp.Body.Close() // 关闭当前响应体
+			if tokenmanager.SwitchTokenAndRetry(c, 3) {
+				// 递归调用自身进行重试
+				handleNonStreamRequest(c, augmentReq, model)
+				return
+			}
+		}
+
 		c.JSON(resp.StatusCode, gin.H{"error": errMsg})
 		return
 	}
@@ -1357,7 +1393,7 @@ func handleNonStreamRequest(c *gin.Context, augmentReq AugmentRequest, model str
 				"mode":  augmentReq.Mode,
 			}).Info("检测到block信息，将token加入冷却队列10分钟")
 
-			err := SetTokenCoolStatus(token, 10*time.Minute)
+			err := tokenmanager.SetTokenCoolStatus(token, 10*time.Minute)
 			if err != nil {
 				logger.Log.WithFields(logrus.Fields{
 					"token": token,
@@ -1439,7 +1475,7 @@ func cleanupRequestStatus(c *gin.Context) {
 	}
 
 	// 更新请求状态为已完成
-	err := SetTokenRequestStatus(token, TokenRequestStatus{
+	err := tokenmanager.SetTokenRequestStatus(token, tokenmanager.TokenRequestStatus{
 		InProgress:    false,
 		LastRequestAt: time.Now(),
 	})
@@ -1617,6 +1653,15 @@ func handleAnthropicStreamRequest(c *gin.Context, augmentReq AugmentRequest, mod
 			"mode":  augmentReq.Mode,
 		}).Error("请求失败")
 
+		// 检查是否是连接错误，如果是则尝试切换Token重试
+		if shouldRetryError(err.Error()) {
+			if tokenmanager.SwitchTokenAndRetry(c, 3) {
+				// 递归调用自身进行重试
+				handleAnthropicStreamRequest(c, augmentReq, model)
+				return
+			}
+		}
+
 		// 切换到CHAT模式
 		augmentReq.Mode = "CHAT"
 		augmentReq.UserGuideLines = "使用中文回答"
@@ -1649,6 +1694,14 @@ func handleAnthropicStreamRequest(c *gin.Context, augmentReq AugmentRequest, mod
 		// 重新发送请求
 		resp, err = client.Do(req)
 		if err != nil {
+			// 再次检查是否是连接错误，如果是则尝试切换Token重试
+			if shouldRetryError(err.Error()) {
+				if tokenmanager.SwitchTokenAndRetry(c, 3) {
+					// 递归调用自身进行重试
+					handleAnthropicStreamRequest(c, augmentReq, model)
+					return
+				}
+			}
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "请求失败: " + err.Error()})
 			return
 		}
@@ -1662,6 +1715,17 @@ func handleAnthropicStreamRequest(c *gin.Context, augmentReq AugmentRequest, mod
 		if err == nil {
 			errMsg = errMsg + ": " + string(body)
 		}
+
+		// 检查是否需要切换Token重试
+		if shouldRetryStatusCode(resp.StatusCode) || shouldRetryError(errMsg) {
+			resp.Body.Close() // 关闭当前响应体
+			if tokenmanager.SwitchTokenAndRetry(c, 3) {
+				// 递归调用自身进行重试
+				handleAnthropicStreamRequest(c, augmentReq, model)
+				return
+			}
+		}
+
 		c.JSON(resp.StatusCode, gin.H{"error": errMsg})
 		return
 	}
@@ -1705,7 +1769,7 @@ func handleAnthropicStreamRequest(c *gin.Context, augmentReq AugmentRequest, mod
 				"mode":  augmentReq.Mode,
 			}).Info("检测到block信息，将token加入冷却队列10分钟")
 
-			err := SetTokenCoolStatus(token, 10*time.Minute)
+			err := tokenmanager.SetTokenCoolStatus(token, 10*time.Minute)
 			if err != nil {
 				logger.Log.WithFields(logrus.Fields{
 					"token": token,
@@ -1960,6 +2024,14 @@ func handleAnthropicNonStreamRequest(c *gin.Context, augmentReq AugmentRequest, 
 	client := createHTTPClient()
 	resp, err := client.Do(req)
 	if err != nil {
+		// 检查是否是连接错误，如果是则尝试切换Token重试
+		if shouldRetryError(err.Error()) {
+			if tokenmanager.SwitchTokenAndRetry(c, 3) {
+				// 递归调用自身进行重试
+				handleAnthropicNonStreamRequest(c, augmentReq, model)
+				return
+			}
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "请求失败: " + err.Error()})
 		return
 	}
@@ -1972,6 +2044,17 @@ func handleAnthropicNonStreamRequest(c *gin.Context, augmentReq AugmentRequest, 
 		if err == nil {
 			errMsg = errMsg + ": " + string(body)
 		}
+
+		// 检查是否需要切换Token重试
+		if shouldRetryStatusCode(resp.StatusCode) || shouldRetryError(errMsg) {
+			resp.Body.Close() // 关闭当前响应体
+			if tokenmanager.SwitchTokenAndRetry(c, 3) {
+				// 递归调用自身进行重试
+				handleAnthropicNonStreamRequest(c, augmentReq, model)
+				return
+			}
+		}
+
 		c.JSON(resp.StatusCode, gin.H{"error": errMsg})
 		return
 	}
@@ -2010,7 +2093,7 @@ func handleAnthropicNonStreamRequest(c *gin.Context, augmentReq AugmentRequest, 
 				"mode":  augmentReq.Mode,
 			}).Info("检测到block信息，将token加入冷却队列10分钟")
 
-			err := SetTokenCoolStatus(token, 10*time.Minute)
+			err := tokenmanager.SetTokenCoolStatus(token, 10*time.Minute)
 			if err != nil {
 				logger.Log.WithFields(logrus.Fields{
 					"token": token,
@@ -2055,4 +2138,733 @@ func handleAnthropicNonStreamRequest(c *gin.Context, augmentReq AugmentRequest, 
 	}
 
 	c.JSON(http.StatusOK, anthropicResp)
+}
+
+// handleRequestWithStreamFallback 优先使用流式输出，失败时降级到非流式输出
+func handleRequestWithStreamFallback(c *gin.Context, augmentReq AugmentRequest, model string, clientWantsStream bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Log.WithFields(logrus.Fields{
+				"error": r,
+				"model": model,
+			}).Error("处理请求时发生panic")
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "服务器内部错误"})
+		}
+		cleanupRequestStatus(c)
+	}()
+
+	// 先尝试流式输出
+	success := tryStreamRequest(c, augmentReq, model, clientWantsStream)
+	if success {
+		return
+	}
+
+	// 流式输出失败，尝试非流式输出
+	logger.Log.WithFields(logrus.Fields{
+		"model": model,
+	}).Info("流式输出失败，降级到非流式输出")
+
+	tryNonStreamRequest(c, augmentReq, model, clientWantsStream)
+}
+
+// handleAnthropicRequestWithStreamFallback 优先使用流式输出，失败时降级到非流式输出
+func handleAnthropicRequestWithStreamFallback(c *gin.Context, augmentReq AugmentRequest, model string, clientWantsStream bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Log.WithFields(logrus.Fields{
+				"error": r,
+				"model": model,
+			}).Error("处理Anthropic请求时发生panic")
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "服务器内部错误"})
+		}
+		cleanupRequestStatus(c)
+	}()
+
+	// 先尝试流式输出
+	success := tryAnthropicStreamRequest(c, augmentReq, model, clientWantsStream)
+	if success {
+		return
+	}
+
+	// 流式输出失败，尝试非流式输出
+	logger.Log.WithFields(logrus.Fields{
+		"model": model,
+	}).Info("Anthropic流式输出失败，降级到非流式输出")
+
+	tryAnthropicNonStreamRequest(c, augmentReq, model, clientWantsStream)
+}
+
+// tryStreamRequest 尝试流式请求，返回是否成功
+func tryStreamRequest(c *gin.Context, augmentReq AugmentRequest, model string, clientWantsStream bool) bool {
+	// 从上下文中获取token和tenant_url
+	tokenInterface, exists := c.Get("token")
+	tenantURLInterface, exists2 := c.Get("tenant_url")
+
+	var token, tenant string
+
+	if exists && exists2 {
+		token, _ = tokenInterface.(string)
+		tenant, _ = tenantURLInterface.(string)
+	}
+
+	// 如果上下文中没有，则使用GetAuthInfo获取
+	if token == "" || tenant == "" {
+		token, tenant = GetAuthInfo()
+	}
+
+	if token == "" || tenant == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "无可用Token,请先在管理页面获取"})
+		return false
+	}
+
+	// 异步处理token使用计数
+	asyncIncrementTokenUsage(token, model)
+
+	// 准备请求数据
+	jsonData, err := json.Marshal(augmentReq)
+	if err != nil {
+		logger.Log.WithFields(logrus.Fields{
+			"error": err.Error(),
+		}).Error("序列化请求失败")
+		return false
+	}
+
+	// 提取主机部分
+	parsedURL, err := url.Parse(tenant)
+	if err != nil {
+		logger.Log.WithFields(logrus.Fields{
+			"error": err.Error(),
+		}).Error("解析租户URL失败")
+		return false
+	}
+	hostName := parsedURL.Host
+
+	// 创建请求
+	requestURL := tenant + "chat-stream"
+	req, err := http.NewRequest("POST", requestURL, bytes.NewReader(jsonData))
+	if err != nil {
+		logger.Log.WithFields(logrus.Fields{
+			"error": err.Error(),
+		}).Error("创建请求失败")
+		return false
+	}
+
+	// 设置请求头
+	req.Header.Set("Host", hostName)
+	req.Header.Set("Content-Length", fmt.Sprintf("%d", len(jsonData)))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("User-Agent", config.AppConfig.UserAgent)
+	req.Header.Set("x-api-version", "2")
+
+	// 生成请求ID
+	requestID := uuid.New().String()
+	req.Header.Set("x-request-id", requestID)
+
+	// 从context中获取session_id
+	sessionIDInterface, exists := c.Get("session_id")
+	var sessionID string
+	if !exists {
+		sessionID = uuid.New().String()
+	} else {
+		sessionID = sessionIDInterface.(string)
+	}
+	req.Header.Set("x-request-session-id", sessionID)
+
+	client := createHTTPClient()
+	resp, err := client.Do(req)
+	if err != nil {
+		logger.Log.WithFields(logrus.Fields{
+			"error": err.Error(),
+		}).Error("流式请求失败")
+
+		// 检查是否是连接错误，如果是则尝试切换Token重试
+		if shouldRetryError(err.Error()) {
+			if tokenmanager.SwitchTokenAndRetry(c, 3) {
+				// 递归调用自身进行重试
+				return tryStreamRequest(c, augmentReq, model, clientWantsStream)
+			}
+		}
+		return false
+	}
+	defer resp.Body.Close()
+
+	// 检查响应状态码
+	if resp.StatusCode != http.StatusOK {
+		body, err := io.ReadAll(resp.Body)
+		errMsg := "Augment response error"
+		if err == nil {
+			errMsg = errMsg + ": " + string(body)
+		}
+
+		logger.Log.WithFields(logrus.Fields{
+			"status_code": resp.StatusCode,
+			"error":       errMsg,
+		}).Error("流式请求响应错误")
+
+		// 检查是否需要切换Token重试
+		if shouldRetryStatusCode(resp.StatusCode) || shouldRetryError(errMsg) {
+			resp.Body.Close()
+			if tokenmanager.SwitchTokenAndRetry(c, 3) {
+				// 递归调用自身进行重试
+				return tryStreamRequest(c, augmentReq, model, clientWantsStream)
+			}
+		}
+		return false
+	}
+
+	// 成功获取流式响应，根据客户端需求处理
+	if clientWantsStream {
+		// 客户端需要流式响应，直接转发
+		return processStreamResponse(c, resp, model)
+	} else {
+		// 客户端需要非流式响应，收集完整响应后返回
+		return processStreamToNonStream(c, resp, model)
+	}
+}
+
+// shouldRetryError 判断是否应该因为错误而重试
+func shouldRetryError(errMsg string) bool {
+	errMsgLower := strings.ToLower(errMsg)
+
+	// 网络连接相关错误
+	networkErrors := []string{
+		"eof",
+		"connection",
+		"connection error",
+		"connection reset",
+		"connection refused",
+		"connection timeout",
+		"timeout",
+		"reset",
+		"broken pipe",
+		"network",
+		"unreachable",
+		"no route to host",
+		"host unreachable",
+	}
+
+	// API相关错误
+	apiErrors := []string{
+		"api error",
+		"server error",
+		"internal error",
+		"service unavailable",
+		"bad gateway",
+		"gateway timeout",
+		"upstream",
+		"proxy error",
+	}
+
+	// 检查所有错误类型
+	allErrors := append(networkErrors, apiErrors...)
+	for _, errorType := range allErrors {
+		if strings.Contains(errMsgLower, errorType) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// shouldRetryStatusCode 判断是否应该因为状态码而重试
+func shouldRetryStatusCode(statusCode int) bool {
+	return statusCode == http.StatusTooManyRequests ||
+		   statusCode == http.StatusInternalServerError ||
+		   statusCode == http.StatusBadGateway ||
+		   statusCode == http.StatusServiceUnavailable ||
+		   statusCode == http.StatusGatewayTimeout
+}
+
+// processStreamResponse 处理流式响应并转发给客户端
+func processStreamResponse(c *gin.Context, resp *http.Response, model string) bool {
+	flusher, ok := c.Writer.(http.Flusher)
+	if !ok {
+		logger.Log.Error("流式传输不支持")
+		return false
+	}
+
+	// 设置流式响应头
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+
+	reader := bufio.NewReader(resp.Body)
+	responseID := fmt.Sprintf("chatcmpl-%d", time.Now().Unix())
+
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			logger.Log.WithFields(logrus.Fields{
+				"error": err.Error(),
+			}).Error("读取流式响应失败")
+			return false
+		}
+
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		var augmentResp AugmentResponse
+		if err := json.Unmarshal([]byte(line), &augmentResp); err != nil {
+			continue
+		}
+
+		// 创建OpenAI兼容的流式响应
+		streamResp := OpenAIStreamResponse{
+			ID:      responseID,
+			Object:  "chat.completion.chunk",
+			Created: time.Now().Unix(),
+			Model:   model,
+			Choices: []StreamChoice{
+				{
+					Index: 0,
+					Delta: ChatMessage{
+						Role:    "assistant",
+						Content: augmentResp.Text,
+					},
+					FinishReason: nil,
+				},
+			},
+		}
+
+		// 如果是最后一条消息，设置完成原因
+		if augmentResp.Done {
+			finishReason := "stop"
+			streamResp.Choices[0].FinishReason = &finishReason
+		}
+
+		// 序列化并发送响应
+		jsonResp, err := json.Marshal(streamResp)
+		if err != nil {
+			continue
+		}
+
+		fmt.Fprintf(c.Writer, "data: %s\n\n", jsonResp)
+		flusher.Flush()
+
+		// 如果完成，发送最后的[DONE]标记
+		if augmentResp.Done {
+			fmt.Fprintf(c.Writer, "data: [DONE]\n\n")
+			flusher.Flush()
+			break
+		}
+	}
+
+	return true
+}
+
+// processStreamToNonStream 将流式响应收集为完整响应
+func processStreamToNonStream(c *gin.Context, resp *http.Response, model string) bool {
+	reader := bufio.NewReader(resp.Body)
+	var fullText string
+
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			logger.Log.WithFields(logrus.Fields{
+				"error": err.Error(),
+			}).Error("读取流式响应失败")
+			return false
+		}
+
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		var augmentResp AugmentResponse
+		if err := json.Unmarshal([]byte(line), &augmentResp); err != nil {
+			continue
+		}
+
+		fullText += augmentResp.Text
+
+		if augmentResp.Done {
+			break
+		}
+	}
+
+	// 创建OpenAI兼容的非流式响应
+	finishReason := "stop"
+	openAIResp := OpenAIResponse{
+		ID:      fmt.Sprintf("chatcmpl-%d", time.Now().Unix()),
+		Object:  "chat.completion",
+		Created: time.Now().Unix(),
+		Model:   model,
+		Choices: []Choice{
+			{
+				Index: 0,
+				Message: ChatMessage{
+					Role:    "assistant",
+					Content: fullText,
+				},
+				FinishReason: &finishReason,
+			},
+		},
+		Usage: Usage{
+			PromptTokens:     estimateTokenCount(""),
+			CompletionTokens: estimateTokenCount(fullText),
+			TotalTokens:      estimateTokenCount(fullText),
+		},
+	}
+
+	c.JSON(http.StatusOK, openAIResp)
+	return true
+}
+
+// tryNonStreamRequest 尝试非流式请求
+func tryNonStreamRequest(c *gin.Context, augmentReq AugmentRequest, model string, clientWantsStream bool) {
+	// 如果流式请求失败，直接调用原有的非流式处理函数
+	if clientWantsStream {
+		// 客户端期望流式响应，但后端只能提供非流式，需要模拟流式响应
+		handleNonStreamAsStream(c, augmentReq, model)
+	} else {
+		// 客户端期望非流式响应，直接调用非流式处理
+		handleNonStreamRequest(c, augmentReq, model)
+	}
+}
+
+// handleNonStreamAsStream 将非流式响应模拟为流式响应
+func handleNonStreamAsStream(c *gin.Context, augmentReq AugmentRequest, model string) {
+	// 先获取完整的非流式响应
+	fullResponse := getNonStreamResponse(c, augmentReq, model)
+	if fullResponse == "" {
+		return // 错误已在getNonStreamResponse中处理
+	}
+
+	// 设置流式响应头
+	flusher, ok := c.Writer.(http.Flusher)
+	if !ok {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "流式传输不支持"})
+		return
+	}
+
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+
+	responseID := fmt.Sprintf("chatcmpl-%d", time.Now().Unix())
+
+	// 将完整响应分块发送，模拟流式输出
+	chunkSize := 50 // 每次发送50个字符
+	runes := []rune(fullResponse)
+
+	for i := 0; i < len(runes); i += chunkSize {
+		end := i + chunkSize
+		if end > len(runes) {
+			end = len(runes)
+		}
+
+		chunk := string(runes[i:end])
+		isLast := end >= len(runes)
+
+		streamResp := OpenAIStreamResponse{
+			ID:      responseID,
+			Object:  "chat.completion.chunk",
+			Created: time.Now().Unix(),
+			Model:   model,
+			Choices: []StreamChoice{
+				{
+					Index: 0,
+					Delta: ChatMessage{
+						Role:    "assistant",
+						Content: chunk,
+					},
+					FinishReason: nil,
+				},
+			},
+		}
+
+		if isLast {
+			finishReason := "stop"
+			streamResp.Choices[0].FinishReason = &finishReason
+		}
+
+		jsonResp, err := json.Marshal(streamResp)
+		if err != nil {
+			continue
+		}
+
+		fmt.Fprintf(c.Writer, "data: %s\n\n", jsonResp)
+		flusher.Flush()
+
+		if isLast {
+			fmt.Fprintf(c.Writer, "data: [DONE]\n\n")
+			flusher.Flush()
+			break
+		}
+
+		// 添加小延迟模拟真实的流式输出
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// getNonStreamResponse 获取非流式响应的完整文本
+func getNonStreamResponse(c *gin.Context, augmentReq AugmentRequest, model string) string {
+	// 从上下文中获取token和tenant_url
+	tokenInterface, exists := c.Get("token")
+	tenantURLInterface, exists2 := c.Get("tenant_url")
+
+	var token, tenant string
+
+	if exists && exists2 {
+		token, _ = tokenInterface.(string)
+		tenant, _ = tenantURLInterface.(string)
+	}
+
+	if token == "" || tenant == "" {
+		token, tenant = GetAuthInfo()
+	}
+
+	if token == "" || tenant == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "无可用Token,请先在管理页面获取"})
+		return ""
+	}
+
+	// 准备请求数据
+	jsonData, err := json.Marshal(augmentReq)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "序列化请求失败"})
+		return ""
+	}
+
+	// 提取租户地址
+	parsedURL, err := url.Parse(tenant)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "解析租户URL失败"})
+		return ""
+	}
+	hostName := parsedURL.Host
+
+	requestURL := tenant + "chat-stream"
+	req, err := http.NewRequest("POST", requestURL, bytes.NewReader(jsonData))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "创建请求失败"})
+		return ""
+	}
+
+	// 设置请求头
+	req.Header.Set("Host", hostName)
+	req.Header.Set("Content-Length", fmt.Sprintf("%d", len(jsonData)))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("User-Agent", config.AppConfig.UserAgent)
+	req.Header.Set("x-api-version", "5")
+
+	requestID := uuid.New().String()
+	req.Header.Set("x-request-id", requestID)
+
+	sessionIDInterface, exists := c.Get("session_id")
+	var sessionID string
+	if !exists {
+		sessionID = uuid.New().String()
+	} else {
+		sessionID = sessionIDInterface.(string)
+	}
+	req.Header.Set("x-request-session-id", sessionID)
+
+	client := createHTTPClient()
+	resp, err := client.Do(req)
+	if err != nil {
+		// 检查是否是连接错误，如果是则尝试切换Token重试
+		if shouldRetryError(err.Error()) {
+			if tokenmanager.SwitchTokenAndRetry(c, 3) {
+				// 递归调用自身进行重试
+				return getNonStreamResponse(c, augmentReq, model)
+			}
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "请求失败: " + err.Error()})
+		return ""
+	}
+	defer resp.Body.Close()
+
+	// 检查响应状态码
+	if resp.StatusCode != http.StatusOK {
+		body, err := io.ReadAll(resp.Body)
+		errMsg := "Augment response error"
+		if err == nil {
+			errMsg = errMsg + ": " + string(body)
+		}
+
+		// 检查是否需要切换Token重试
+		if shouldRetryStatusCode(resp.StatusCode) || shouldRetryError(errMsg) {
+			resp.Body.Close()
+			if tokenmanager.SwitchTokenAndRetry(c, 3) {
+				// 递归调用自身进行重试
+				return getNonStreamResponse(c, augmentReq, model)
+			}
+		}
+
+		c.JSON(resp.StatusCode, gin.H{"error": errMsg})
+		return ""
+	}
+
+	// 读取完整响应
+	reader := bufio.NewReader(resp.Body)
+	var fullText string
+
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "读取响应失败: " + err.Error()})
+			return ""
+		}
+
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		var augmentResp AugmentResponse
+		if err := json.Unmarshal([]byte(line), &augmentResp); err != nil {
+			continue
+		}
+
+		fullText += augmentResp.Text
+
+		if augmentResp.Done {
+			break
+		}
+	}
+
+	return fullText
+}
+
+// tryAnthropicStreamRequest 尝试Anthropic流式请求
+func tryAnthropicStreamRequest(c *gin.Context, augmentReq AugmentRequest, model string, clientWantsStream bool) bool {
+	// 简化实现：直接使用现有的流式处理逻辑，但在内部处理错误
+	// 如果客户端需要流式响应，直接调用流式处理
+	if clientWantsStream {
+		handleAnthropicStreamRequest(c, augmentReq, model)
+		return true
+	} else {
+		// 客户端需要非流式响应，但我们先尝试流式获取数据，然后转换
+		fullResponse := getAnthropicNonStreamResponse(c, augmentReq, model)
+		if fullResponse == "" {
+			return false
+		}
+
+		// 创建Anthropic非流式响应
+		stopReason := "end_turn"
+		inputTokens := estimateTokenCount("")
+		outputTokens := estimateTokenCount(fullResponse)
+
+		anthropicResp := AnthropicResponse{
+			ID:   fmt.Sprintf("msg_%d", time.Now().Unix()),
+			Type: "message",
+			Role: "assistant",
+			Content: []AnthropicContent{
+				{
+					Type: "text",
+					Text: fullResponse,
+				},
+			},
+			Model:        model,
+			StopReason:   &stopReason,
+			StopSequence: nil,
+			Usage: AnthropicUsage{
+				InputTokens:  inputTokens,
+				OutputTokens: outputTokens,
+			},
+		}
+
+		c.JSON(http.StatusOK, anthropicResp)
+		return true
+	}
+}
+
+// tryAnthropicNonStreamRequest 尝试Anthropic非流式请求
+func tryAnthropicNonStreamRequest(c *gin.Context, augmentReq AugmentRequest, model string, clientWantsStream bool) {
+	if clientWantsStream {
+		// 客户端期望流式响应，但后端只能提供非流式，需要模拟流式响应
+		handleAnthropicNonStreamAsStream(c, augmentReq, model)
+	} else {
+		// 客户端期望非流式响应，直接调用非流式处理
+		handleAnthropicNonStreamRequest(c, augmentReq, model)
+	}
+}
+
+// handleAnthropicNonStreamAsStream 将Anthropic非流式响应模拟为流式响应
+func handleAnthropicNonStreamAsStream(c *gin.Context, augmentReq AugmentRequest, model string) {
+	// 先获取完整的非流式响应
+	fullResponse := getAnthropicNonStreamResponse(c, augmentReq, model)
+	if fullResponse == "" {
+		return // 错误已在函数中处理
+	}
+
+	// 设置Anthropic流式响应头
+	flusher, ok := c.Writer.(http.Flusher)
+	if !ok {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "流式传输不支持"})
+		return
+	}
+
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+
+	// 将完整响应分块发送，模拟流式输出
+	chunkSize := 50 // 每次发送50个字符
+	runes := []rune(fullResponse)
+
+	for i := 0; i < len(runes); i += chunkSize {
+		end := i + chunkSize
+		if end > len(runes) {
+			end = len(runes)
+		}
+
+		chunk := string(runes[i:end])
+		isLast := end >= len(runes)
+
+		if chunk != "" {
+			streamResp := AnthropicStreamResponse{
+				Type: "content_block_delta",
+				Index: 0,
+				Delta: map[string]interface{}{
+					"type": "text_delta",
+					"text": chunk,
+				},
+			}
+
+			jsonResp, err := json.Marshal(streamResp)
+			if err != nil {
+				continue
+			}
+
+			fmt.Fprintf(c.Writer, "event: content_block_delta\ndata: %s\n\n", jsonResp)
+			flusher.Flush()
+		}
+
+		if isLast {
+			stopResp := AnthropicStreamResponse{
+				Type: "message_stop",
+			}
+			jsonResp, err := json.Marshal(stopResp)
+			if err == nil {
+				fmt.Fprintf(c.Writer, "event: message_stop\ndata: %s\n\n", jsonResp)
+				flusher.Flush()
+			}
+			break
+		}
+
+		// 添加小延迟模拟真实的流式输出
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// getAnthropicNonStreamResponse 获取Anthropic非流式响应的完整文本
+func getAnthropicNonStreamResponse(c *gin.Context, augmentReq AugmentRequest, model string) string {
+	// 这里可以复用getNonStreamResponse的逻辑，因为底层API是相同的
+	return getNonStreamResponse(c, augmentReq, model)
 }

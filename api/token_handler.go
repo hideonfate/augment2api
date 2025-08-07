@@ -3,11 +3,10 @@ package api
 import (
 	"augment2api/config"
 	"augment2api/pkg/logger"
+	tokenmanager "augment2api/pkg/token"
 	"bytes"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"math/rand"
 	"net/http"
 	"sort"
 	"strconv"
@@ -16,7 +15,6 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/go-redis/redis/v8"
 	"github.com/google/uuid"
 	"github.com/sirupsen/logrus"
 )
@@ -40,17 +38,7 @@ type TokenItem struct {
 	TenantUrl string `json:"tenantUrl"`
 }
 
-// TokenRequestStatus 记录 token 请求状态
-type TokenRequestStatus struct {
-	InProgress    bool      `json:"in_progress"`
-	LastRequestAt time.Time `json:"last_request_at"`
-}
 
-// TokenCoolStatus 记录 token 冷却状态
-type TokenCoolStatus struct {
-	InCool  bool      `json:"in_cool"`
-	CoolEnd time.Time `json:"cool_end"`
-}
 
 // GetRedisTokenHandler 从Redis获取token列表，支持分页
 func GetRedisTokenHandler(c *gin.Context) {
@@ -134,7 +122,7 @@ func GetRedisTokenHandler(c *gin.Context) {
 			sessionID := fields["session_id"]
 
 			// 获取token的冷却状态 (异步获取)
-			coolStatus, _ := GetTokenCoolStatus(tokenValue)
+			coolStatus, _ := tokenmanager.GetTokenCoolStatus(tokenValue)
 
 			// 获取使用次数 (可以考虑将这些计数缓存在Redis中)
 			chatCount := getTokenChatUsageCount(tokenValue)
@@ -652,204 +640,10 @@ func CheckAllTokensHandler(c *gin.Context) {
 	})
 }
 
-// SetTokenRequestStatus 设置token请求状态
-func SetTokenRequestStatus(token string, status TokenRequestStatus) error {
-	// 使用Redis存储token请求状态
-	key := "token_status:" + token
 
-	// 将状态转换为JSON
-	statusJSON, err := json.Marshal(status)
-	if err != nil {
-		return err
-	}
 
-	// 存储到Redis，设置过期时间为1小时
-	return config.RedisSet(key, string(statusJSON), time.Hour)
-}
 
-// GetTokenRequestStatus 获取token请求状态
-func GetTokenRequestStatus(token string) (TokenRequestStatus, error) {
-	key := "token_status:" + token
 
-	// 从Redis获取状态
-	statusJSON, err := config.RedisGet(key)
-	if err != nil {
-		// 如果key不存在，返回默认状态
-		if errors.Is(err, redis.Nil) {
-			return TokenRequestStatus{
-				InProgress:    false,
-				LastRequestAt: time.Time{}, // 零值时间
-			}, nil
-		}
-		return TokenRequestStatus{}, err
-	}
-
-	// 解析JSON
-	var status TokenRequestStatus
-	if err := json.Unmarshal([]byte(statusJSON), &status); err != nil {
-		return TokenRequestStatus{}, err
-	}
-
-	return status, nil
-}
-
-// SetTokenCoolStatus 将token加入冷却队列
-func SetTokenCoolStatus(token string, duration time.Duration) error {
-	// 使用Redis存储token冷却状态
-	key := "token_cool_status:" + token
-
-	coolStatus := TokenCoolStatus{
-		InCool:  true,
-		CoolEnd: time.Now().Add(duration),
-	}
-
-	// 将状态转换为JSON
-	coolStatusJSON, err := json.Marshal(coolStatus)
-	if err != nil {
-		return err
-	}
-
-	// 存储到Redis，设置过期时间与冷却时间相同
-	return config.RedisSet(key, string(coolStatusJSON), duration)
-}
-
-// GetTokenCoolStatus 获取token冷却状态
-func GetTokenCoolStatus(token string) (TokenCoolStatus, error) {
-	key := "token_cool_status:" + token
-
-	// 从Redis获取状态
-	coolStatusJSON, err := config.RedisGet(key)
-	if err != nil {
-		// 如果key不存在，返回默认状态
-		if errors.Is(err, redis.Nil) {
-			return TokenCoolStatus{
-				InCool:  false,
-				CoolEnd: time.Time{}, // 零值时间
-			}, nil
-		}
-		return TokenCoolStatus{}, err
-	}
-
-	// 解析JSON
-	var coolStatus TokenCoolStatus
-	if err := json.Unmarshal([]byte(coolStatusJSON), &coolStatus); err != nil {
-		return TokenCoolStatus{}, err
-	}
-
-	// 检查冷却时间是否已过
-	if time.Now().After(coolStatus.CoolEnd) {
-		coolStatus.InCool = false
-	}
-
-	return coolStatus, nil
-}
-
-// GetAvailableToken 获取一个可用的token（未在使用中且冷却时间已过），同时返回token、tenant_url和session_id
-func GetAvailableToken() (string, string, string) {
-	// 获取所有token的key
-	keys, err := config.RedisKeys("token:*")
-	if err != nil || len(keys) == 0 {
-		return "No token", "", ""
-	}
-
-	// 筛选可用的token
-	var availableTokens []string
-	var availableTenantURLs []string
-	var availableSessionIDs []string
-	var cooldownTokens []string
-	var cooldownTenantURLs []string
-	var cooldownSessionIDs []string
-
-	for _, key := range keys {
-		// 获取token状态
-		status, err := config.RedisHGet(key, "status")
-		if err == nil && status == "disabled" {
-			continue // 跳过被标记为不可用的token
-		}
-
-		// 从key中提取token
-		token := key[6:] // 去掉前缀 "token:"
-
-		// 获取token的请求状态
-		requestStatus, err := GetTokenRequestStatus(token)
-		if err != nil {
-			continue
-		}
-
-		// 如果token正在使用中，跳过
-		if requestStatus.InProgress {
-			continue
-		}
-
-		// 如果距离上次请求不足3秒，跳过
-		if time.Since(requestStatus.LastRequestAt) < 3*time.Second {
-			continue
-		}
-
-		// 检查CHAT模式和AGENT模式的使用次数限制
-		chatUsageCount := getTokenChatUsageCount(token)
-		agentUsageCount := getTokenAgentUsageCount(token)
-
-		// 如果CHAT模式已达到3000次限制，跳过
-		if chatUsageCount >= 3000 {
-			continue
-		}
-
-		// 如果AGENT模式已达到50次限制，跳过
-		if agentUsageCount >= 50 {
-			continue
-		}
-
-		// 获取对应的tenant_url
-		tenantURL, err := config.RedisHGet(key, "tenant_url")
-		if err != nil {
-			continue
-		}
-
-		// 获取对应的session_id
-		sessionID, err := config.RedisHGet(key, "session_id")
-		if err != nil {
-			// 如果没有session_id，生成一个新的
-			sessionID = uuid.New().String()
-			config.RedisHSet(key, "session_id", sessionID)
-		}
-
-		// 检查token是否在冷却中
-		coolStatus, err := GetTokenCoolStatus(token)
-		if err != nil {
-			continue
-		}
-
-		// 如果token在冷却中，放入冷却队列
-		if coolStatus.InCool {
-			cooldownTokens = append(cooldownTokens, token)
-			cooldownTenantURLs = append(cooldownTenantURLs, tenantURL)
-			cooldownSessionIDs = append(cooldownSessionIDs, sessionID)
-		} else {
-			// 否则放入可用队列
-			availableTokens = append(availableTokens, token)
-			availableTenantURLs = append(availableTenantURLs, tenantURL)
-			availableSessionIDs = append(availableSessionIDs, sessionID)
-		}
-	}
-
-	// 优先从可用队列中选择token
-	if len(availableTokens) > 0 {
-		// 随机选择一个token
-		randomIndex := rand.Intn(len(availableTokens))
-		return availableTokens[randomIndex], availableTenantURLs[randomIndex], availableSessionIDs[randomIndex]
-	}
-
-	// 如果没有非冷却token可用，则从冷却队列中选择
-	if len(cooldownTokens) > 0 {
-		// 随机选择一个token
-		randomIndex := rand.Intn(len(cooldownTokens))
-		return cooldownTokens[randomIndex], cooldownTenantURLs[randomIndex], cooldownSessionIDs[randomIndex]
-	}
-
-	// 如果没有任何可用的token
-	return "No available token", "", ""
-}
 
 // getTokenChatUsageCount 获取token的CHAT模式使用次数
 func getTokenChatUsageCount(token string) int {
